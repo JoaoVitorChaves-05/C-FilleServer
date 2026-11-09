@@ -53,7 +53,7 @@ int main (int argc, char *argv[]) {
 	saddr.sin_port = htons(atoi(argv[2]));
 	saddr.sin_addr.s_addr = inet_addr(argv[1]);
 
-	/* ---- metricas (testes.md) ---- */
+	/* ---- metricas ---- */
 	struct timeval t1_conn, t2_conn;				/* connect: 1 RTT */
 	struct timeval t1_req, t2_req;					/* requisicao inteira: do connect ate o fim da resposta */
 	struct timeval t1_dados = {0}, t2_dados = {0};	/* so a transferencia do arquivo */
@@ -75,7 +75,6 @@ int main (int argc, char *argv[]) {
 	/* ---- GET ---- */
 	if (request.method == FILE_GET) {
 		// send
-
 		int ns = send(sfd, &request, sizeof(struct msg_request_t), 0);
 		if (ns != sizeof(struct msg_request_t)) { 
 			if (ns < 0) {
@@ -88,8 +87,13 @@ int main (int argc, char *argv[]) {
 			return -1;
 		}
 		// recv
-		int nr = recv(sfd, &reply, sizeof(struct msg_reply_t), 0);
-		
+		/* MSG_WAITALL: garante o struct inteiro */
+		int nr = recv(sfd, &reply, sizeof(struct msg_reply_t), MSG_WAITALL);
+
+		/* Inicia a contagem do tempo de transferencia dos dados 
+		 * (do momento em que o servidor respondeu com FILE_200 ate o fim da transferencia) */
+		gettimeofday(&t1_dados, NULL);
+
 		if (nr != sizeof(struct msg_reply_t)) {
 			if (nr < 0) {
 				perror("recv");
@@ -121,7 +125,6 @@ int main (int argc, char *argv[]) {
 
 			/* inicio da transferencia: o servidor ja respondeu FILE_200 e os
 			 * proximos bytes no socket sao o conteudo do arquivo */
-			gettimeofday(&t1_dados, NULL);
 			do {
 				char block[BLOCK_SIZE];
 				nr = recv(sfd, block, sizeof(block), 0);
@@ -160,9 +163,116 @@ int main (int argc, char *argv[]) {
 
 	/* ---- PUT ---- */
 	else if (request.method == FILE_PUT) {
-		/* TODO ao implementar o PUT: gettimeofday(&t1_dados, NULL) antes do loop
-		 * de envio, gettimeofday(&t2_dados, NULL) depois do ultimo bloco, e somar
-		 * em 'bytes' o que foi enviado. O calculo abaixo ja serve pros dois. */
+		int fd = open(request.file_path, O_RDONLY);
+		if (fd < 0) {
+			perror("open");
+			close(sfd);
+			return -1;
+		}
+		
+		// send
+		int ns = send(sfd, &request, sizeof(struct msg_request_t), 0);
+		if (ns != sizeof(struct msg_request_t)) { 
+			if (ns < 0) {
+				perror("send");
+			}
+			else {
+				fprintf(stderr, "Envio incompleto\n");
+			}
+			close(fd);
+			close(sfd);
+			return -1;
+		}
+
+		// recv
+		/* MSG_WAITALL: garante o struct inteiro (ver comentario no GET) */
+		int nr = recv(sfd, &reply, sizeof(struct msg_reply_t), MSG_WAITALL);
+		if (nr != sizeof(struct msg_reply_t)) {
+			if (nr < 0) {
+				perror("recv");
+			}
+			else {
+				fprintf(stderr, "Resposta incompleta do servidor\n");
+			}
+			close(fd);
+			close(sfd);
+			return -1;
+		}
+
+		if		(reply.code == REQ_ERR) {
+			fprintf(stderr, "Erro de requisicao: %s\n", strerror(reply.err));
+			close(fd);
+			close(sfd);
+			return -1;
+		}
+		else if (reply.code == FILE_ERR) {
+			fprintf(stderr, "Erro de arquivo: %s\n", strerror(reply.err));
+			close(fd);
+			close(sfd);
+			return -1;
+		}
+		else if (reply.code == FILE_200)  {
+			/* inicio da transferencia: o servidor ja respondeu FILE_200 e os
+			 * proximos bytes no socket sao o conteudo do arquivo */
+			gettimeofday(&t1_dados, NULL);
+			char block[BLOCK_SIZE];
+			int nb;
+			while ((nb = read(fd, block, sizeof(block))) > 0) {
+				int total = 0;
+				while (total < nb) {
+					/* MSG_NOSIGNAL: se o servidor fechar no meio, o send retorna
+					 * -1/EPIPE em vez de o processo morrer por SIGPIPE sem imprimir nada */
+					ns = send(sfd, block + total, nb - total, MSG_NOSIGNAL);
+					if (ns <= 0) {
+						perror("send");
+						break;
+					}
+					total += ns;
+				}
+				bytes += total; /* atualiza o número de bytes enviados */
+				if (total < nb) { /* bloco nao foi totalmente enviado */
+					close(fd);
+					close(sfd);
+					return -1; /* erro ao enviar o bloco: fecha a conexao */
+				}
+			}
+			if (nb < 0) {
+				perror("read");
+				close(fd);
+				close(sfd);
+				return -1; /* erro ao ler o bloco: fecha a conexao */
+			}
+			close(fd);
+
+			/* Envia um FIN para o servidor, indicando que nao vamos enviar mais dados */
+			if (shutdown(sfd, SHUT_WR) < 0) {
+				perror("shutdown");
+				close(sfd);
+				return -1;
+			}
+
+			nr = recv(sfd, &reply, sizeof(struct msg_reply_t), MSG_WAITALL);
+			/* fim da transferencia: o servidor confirmou que recebeu tudo */
+			gettimeofday(&t2_dados, NULL);
+
+			if (nr != sizeof(struct msg_reply_t)) {
+				if (nr < 0) {
+					perror("recv");
+				}
+				else {
+					fprintf(stderr, "Servidor nao confirmou o PUT\n");
+				}
+				close(sfd);
+				return -1;
+			}
+			if (reply.code != FILE_EOF) {
+				/* ex.: disco cheio no servidor (write falhou) */
+				fprintf(stderr, "Erro de arquivo no servidor: %s\n", strerror(reply.err));
+				close(sfd);
+				return -1;
+			}
+		}
+		close(sfd);
 	}
 
 	/* t2_requisicao: fim da requisicao inteira (arquivo transferido) */

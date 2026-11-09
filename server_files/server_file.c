@@ -20,7 +20,10 @@ void *handle_client_file(void *args) {
     	msg_request_t request;
 	    msg_reply_t reply;
 
-        nr = recv(client.c, &request, sizeof(msg_request_t), 0);
+        /* MSG_WAITALL: TCP eh um stream, um recv pode devolver so parte dos
+         * sizeof(msg_request_t) bytes. Com o flag ele espera o struct inteiro,
+         * ou retorna menos se a conexao fechar/der erro (tratado no if). */
+        nr = recv(client.c, &request, sizeof(msg_request_t), MSG_WAITALL);
         if (nr != sizeof(msg_request_t)) {
             if (nr < 0) {
                 perror("recv");
@@ -111,34 +114,45 @@ void *handle_client_file(void *args) {
                 }
                 char block[BLOCK_SIZE];
                 int nb;
+                int write_err = 0;  /* errno do primeiro write que falhou (0 = ok) */
+                /* recv retorna 0 quando o cliente faz shutdown(SHUT_WR): ai
+                 * todos os bytes do arquivo ja chegaram */
                 while ((nb = recv(client.c, block, sizeof(block), 0)) > 0) {
+                    if (write_err) {
+                        /* write ja falhou: continua lendo e descartando ate o
+                         * FIN do cliente. Se fechasse agora, o cliente (ainda
+                         * enviando) tomaria um RST e poderia perder a resposta
+                         * de erro abaixo. */
+                        continue;
+                    }
                     int total = 0;
                     while (total < nb) {
                         int nw = write(fd, block + total, nb - total);
 
                         if (nw <= 0) {
                             perror("write");
+                            write_err = (nw < 0) ? errno : EIO;
                             break;
                         }
                         total += nw;
                     }
-                    if (total < nb) {
-                        break;
-                    }
                 }
+				close(fd);
 
                 if (nb < 0) {
-                    if (errno != EINTR) {
-                        perror("recv");
+                    /* conexao com erro: nao adianta tentar responder */
+                    perror("recv");
+                }
+                /* Resposta final do PUT: o cliente espera por ela para parar o
+                 * relogio e saber se o arquivo foi gravado de fato. */
+                else {
+                    reply.code = write_err ? FILE_ERR : FILE_EOF;
+                    reply.err = write_err;
+                    ns = send(client.c, &reply, sizeof(msg_reply_t), MSG_NOSIGNAL);
+                    if (ns < 0) {
+                        perror("send PUT reply");
                     }
                 }
-                reply.code = FILE_EOF;
-                reply.err = 0;
-                ns = send(client.c, &reply, sizeof(msg_reply_t), 0);
-                if(ns < 0){
-                    perror("send EOF");
-                }
-                close(fd);
             }
         }
         else{
@@ -171,6 +185,16 @@ int main (int argc, char **argv) {
 	s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 	if (s < 0) {
 		perror("socket");
+		return -1;
+	}
+
+	/* SO_REUSEADDR: o lado que fecha a conexao primeiro fica em TIME_WAIT
+	 * (~60s). No GET quem fecha eh o servidor, entao ao reiniciar ele entre as
+	 * execucoes do teste o bind falharia com "Address already in use".
+	 * Esse flag permite o bind na porta mesmo com conexoes em TIME_WAIT. */
+	int opt = 1;
+	if (setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+		perror("setsockopt");
 		return -1;
 	}
 

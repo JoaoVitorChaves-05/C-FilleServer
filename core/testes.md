@@ -24,9 +24,9 @@
 - n > 10 execucoes por teste
 
 - todos rodando 50 requisicoes com metodo escolhido aleatoriamente
-
-./exec_teste <P processos> <R requisicoes por processo> <tipo arquivo> <metodo aleatorio (50-50), GET ou PUT>
-
+```sh
+./exec_teste <P processos> <R requisicoes por processo> <tipo arquivo> <metodo: aleatorio (50-50), GET ou PUT>
+```
 # Metricas
 - RTT e vazao
 - RTT medido no codigo

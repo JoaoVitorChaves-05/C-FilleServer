@@ -63,7 +63,7 @@ void *handle_client_file(void *args) {
                 do {
                     nb = read(fd, block, BLOCK_SIZE);
                     if (nb > 0) {
-                        // pode ser que o cliente tenha fechado a conexao, nesse caso, como seguir? o retorno do send finaliza o while?
+                        // pode ser que o cliente tenha fechado a conexao
                         /* send pode enviar menos que nb (envio parcial): repete
                          * a partir de block + total ate mandar o bloco inteiro.
                          * MSG_NOSIGNAL: se o cliente ja fechou, o send retorna -1

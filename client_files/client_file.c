@@ -6,6 +6,15 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <sys/time.h>
+
+/* Tempo decorrido entre t1 e t2, em segundos.
+ * struct timeval tem duas partes: tv_sec (segundos) e tv_usec (microssegundos,
+ * de 0 a 999999). Quando t2.tv_usec < t1.tv_usec a parte de usec fica negativa,
+ * mas a diferenca em tv_sec compensa: 2.1s - 1.9s = (2-1) + (100000-900000)/1e6 = 0.2s */
+static double elapsed_s(struct timeval t1, struct timeval t2) {
+	return (t2.tv_sec - t1.tv_sec) + (t2.tv_usec - t1.tv_usec) / 1e6;
+}
 
 int main (int argc, char *argv[]) {
 	// ./client <server ip> <server port> <method> <file path>
@@ -44,15 +53,29 @@ int main (int argc, char *argv[]) {
 	saddr.sin_port = htons(atoi(argv[2]));
 	saddr.sin_addr.s_addr = inet_addr(argv[1]);
 
+	/* ---- metricas (testes.md) ---- */
+	struct timeval t1_conn, t2_conn;				/* connect: 1 RTT */
+	struct timeval t1_req, t2_req;					/* requisicao inteira: do connect ate o fim da resposta */
+	struct timeval t1_dados = {0}, t2_dados = {0};	/* so a transferencia do arquivo */
+	long long bytes = 0;							/* bytes do arquivo transferidos (GET ou PUT) */
+
 	// connect
+	/* O connect() de um socket TCP bloqueia ate o handshake: o cliente manda SYN
+	 * e o connect retorna quando chega o SYN/ACK. Ida e volta = 1 RTT. */
+	gettimeofday(&t1_conn, NULL);
 	if (connect(sfd, (struct sockaddr *)&saddr, sizeof(struct sockaddr_in)) < 0) {
 		perror("connect");
 		return -1;
 	}
+	gettimeofday(&t2_conn, NULL);
+
+	/* t1_requisicao: do connect ate a resposta do servidor, entao ela comeca junto com o connect. */
+	t1_req = t1_conn;
 
 	/* ---- GET ---- */
 	if (request.method == FILE_GET) {
 		// send
+
 		int ns = send(sfd, &request, sizeof(struct msg_request_t), 0);
 		if (ns != sizeof(struct msg_request_t)) { 
 			if (ns < 0) {
@@ -77,13 +100,14 @@ int main (int argc, char *argv[]) {
 			close(sfd);
 			return -1;
 		}
-		if 		(reply.code == REQ_ERR) {
-			fprintf(stderr, "request error: %s\n", strerror(reply.err));
+
+		if		(reply.code == REQ_ERR) {
+			fprintf(stderr, "Erro de requisicao: %s\n", strerror(reply.err));
 			close(sfd);
 			return -1;
 		}
 		else if (reply.code == FILE_ERR) {
-			fprintf(stderr, "file error: %s\n", strerror(reply.err));
+			fprintf(stderr, "Erro de arquivo: %s\n", strerror(reply.err));
 			close(sfd);
 			return -1;
 		}
@@ -95,8 +119,9 @@ int main (int argc, char *argv[]) {
 				return -1;
 			}
 
-			long long bytes = 0;
-
+			/* inicio da transferencia: o servidor ja respondeu FILE_200 e os
+			 * proximos bytes no socket sao o conteudo do arquivo */
+			gettimeofday(&t1_dados, NULL);
 			do {
 				char block[BLOCK_SIZE];
 				nr = recv(sfd, block, sizeof(block), 0);
@@ -119,18 +144,15 @@ int main (int argc, char *argv[]) {
 					}
 				}
 				else if (nr < 0) {
-					if (errno != EINTR) {
-						perror("recv");
-					}
+					perror("recv");
 					close(fd);
 					close(sfd);
-					return -1;
+					return -1;			/* erro ao receber o bloco: fecha a conexao */
 				}
-			} while (nr > 0);
-			/* nr == 0: o servidor fechou a conexao, que eh o sinal de fim do
-			 * arquivo. Nao existe mais mensagem FILE_EOF no GET: ela era gravada
-			 * no arquivo como se fosse dado, corrompendo o final dele. */
-			printf("GET concluido: %lld bytes recebidos\n", bytes);
+			} while (nr > 0); /* nr == 0: o servidor fechou a conexao */
+			/* fim da transferencia: recv retornou 0, o arquivo chegou inteiro */
+			gettimeofday(&t2_dados, NULL);
+
 			close(fd);
 		}
 		close(sfd);
@@ -138,49 +160,36 @@ int main (int argc, char *argv[]) {
 
 	/* ---- PUT ---- */
 	else if (request.method == FILE_PUT) {
-
+		/* TODO ao implementar o PUT: gettimeofday(&t1_dados, NULL) antes do loop
+		 * de envio, gettimeofday(&t2_dados, NULL) depois do ultimo bloco, e somar
+		 * em 'bytes' o que foi enviado. O calculo abaixo ja serve pros dois. */
 	}
+
+	/* t2_requisicao: fim da requisicao inteira (arquivo transferido) */
+	gettimeofday(&t2_req, NULL);
+
+	/* ---- calculo das metricas ---- */
+	double rtt     = elapsed_s(t1_conn, t2_conn);	/* 1 RTT, em segundos */
+	double t_req   = elapsed_s(t1_req, t2_req);		/* requisicao inteira, em segundos */
+	double t_dados = elapsed_s(t1_dados, t2_dados);	/* transferencia do arquivo, em segundos */
+
+	/* Vazao = quantidade / tempo
+	 * bytes * 8 converte para bits, / 1e6 para mega: resultado em Mbps.
+	 * O '> 0' evita divisao por zero (ex.: PUT ainda vazio, t_dados = 0). */
+	double vazao_req   = t_req   > 0 ? (bytes * 8.0) / t_req   / 1e6 : 0;
+	double vazao_dados = t_dados > 0 ? (bytes * 8.0) / t_dados / 1e6 : 0;
+
+	/* RTT medio: cada execucao mede 1 RTT no connect. O "medio" do testes.md
+	 * sai da media dessa coluna entre todas as requisicoes/execucoes, feita
+	 * pelo script de teste ao juntar as linhas abaixo. */
+
+	/* Uma linha CSV por requisicao no stdout (erros vao pro stderr e nao
+	 * misturam). Colunas:
+	 * metodo,bytes,rtt_ms,t_req_ms,t_dados_ms,vazao_req_mbps,vazao_dados_mbps */
+	printf("%s,%lld,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+			argv[3], bytes,
+			rtt * 1e3, t_req * 1e3, t_dados * 1e3,
+			vazao_req, vazao_dados);
 
 	return 0;
 }
-
-// 	get:
-// 		send_get("GET file_path")
-// 		if error:
-//			handle_error()
-//		else:
-//			handle_response()
-//
-
-// what could cause errors?
-// 	- file doesnt exist in the server
-// 	- invalid file path
-// both of which are handled in the server
-
-// 	put:
-//		send_put("PUT file_path")
-//		if error:
-//			handle_error()
-//		else:
-//			handle_response()
-
-// errors can happen if:
-//	- file doesn't exist in the client
-//	- invalid file path
-// both of which are handled in the client
-
-// file path check is the same for both client and server
-// file path must be absolute, no path traversal
-
-// file manipulation errors: must result in operation error too
-
-// send_get:
-// build the request and send
-// no need for file_path handling, the server returns the error if there is any
-// if no error must receive the file and store it 
-// how is the reception handled? why send/recv the file in blocks?
-
-// send_put
-// do we send a request and wait for a response before sending the file?
-// send the file in blocks too, why?
-// handle error in the client: file_path validity and file manipulation errors.

@@ -29,7 +29,7 @@
 ```
 # Metricas
 - RTT e vazao
-- RTT medido no codigo
+- RTT medio medido no codigo
 - Uma medida para o connect (1 RTT)
 - Uma medida para a requisicao inteira (connect ate a resposta do servidor)
 - Uma medida para o tempo de transferencia do arquivo

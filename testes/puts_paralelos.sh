@@ -1,83 +1,89 @@
+
 #!/bin/bash
-# uso: ./put_paralelo.sh N arquivo_origem repeticoes
+# uso: ./put_paralelos.sh N arquivo repeticoes
+
 N=${1:-10}
 ARQ=${2:-pagina_web_teste.html}
 REPETICOES=${3:-11}
 
 SERVER=10.0.4.20
 PORTA=5050
-CLIENT=$HOME/projeto_sockets/client
-ORIGEM=$(readlink -f "$ARQ")      # caminho absoluto do arquivo a enviar
+CLIENT=$HOME/projeto_sockets/client_Dir/client
+
+[ -x "$CLIENT" ] || { echo "Cliente nao encontrado: $CLIENT"; exit 1; }
+ulimit -n 4096 2>/dev/null
+
+ORIGEM=$(readlink -f "$ARQ")
 
 if [ ! -f "$ORIGEM" ]; then
-    echo "Arquivo $ARQ nao encontrado"; exit 1
+    echo "Arquivo $ARQ nao encontrado"
+    exit 1
 fi
 
-TAMANHO=$(stat -c%s "$ORIGEM")
 EXT="${ARQ##*.}"
 
-RESULTADOS="resultados_put_$(date +%Y%m%d_%H%M%S)"
+RESULTADOS="resultados_put_N${N}_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$RESULTADOS"
 CSV="$RESULTADOS/resultados.csv"
-echo "repeticao,cliente,tempo_s,tamanho_bytes,vazao_mbps,status" > "$CSV"
+ERROS="$RESULTADOS/erros.txt"
+
+echo "repeticao,cliente,status,metodo,bytes,rtt_ms,t_req_ms,t_dados_ms,vazao_req_mbps,vazao_dados_mbps" > "$CSV"
+: > "$ERROS"
+
+BASE=$(mktemp -d /tmp/puts.XXXXXX)
+trap 'rm -rf "$BASE"' EXIT
 
 FALHAS=0
-echo "Iniciando testes PUT"
-echo "Clientes: $N | Arquivo: $ARQ ($TAMANHO bytes) | Repeticoes: $REPETICOES"
+
+echo "PUT | Clientes: $N | Arquivo: $ARQ | Repeticoes: $REPETICOES"
 
 for REP in $(seq 1 "$REPETICOES"); do
-    echo "Repeticao $REP/$REPETICOES"
     PIDS=()
-    METRICAS=$(mktemp -d)
-    INICIO_TOTAL=$(date +%s%N)
+    INI=$(date +%s.%N)
 
     for i in $(seq 1 "$N"); do
         (
-            DIR=$(mktemp -d)
-            cd "$DIR" || exit 1
+            D="$BASE/c$i"
+            mkdir -p "$D" && cd "$D" || exit 1
 
-            # nome unico por cliente/repeticao, para nao colidir no servidor
+            # Nome unico por cliente/repeticao
             NOME="put_r${REP}_c${i}.${EXT}"
+
             ln -s "$ORIGEM" "$NOME" 2>/dev/null || cp "$ORIGEM" "$NOME"
 
-            INICIO=$(date +%s%N)
             "$CLIENT" "$SERVER" "$PORTA" PUT "$NOME" \
-                > "$METRICAS/saida_${i}.txt" 2>&1
-            STATUS=$?
-            FIM=$(date +%s%N)
+                > "$D/out.txt" 2> "$D/err.txt"
 
-            if [ "$STATUS" -ne 0 ]; then
-                BYTES=0
-            else
-                BYTES=$TAMANHO
-            fi
-
-            awk -v r="$REP" -v c="$i" -v ini="$INICIO" -v fim="$FIM" \
-                -v b="$BYTES" -v s="$STATUS" 'BEGIN {
-                    t=(fim-ini)/1e9;
-                    v=(t>0)?(b*8)/(t*1e6):0;
-                    printf "%s,%s,%.6f,%s,%.3f,%s\n", r,c,t,b,v,s
-                }' > "$METRICAS/cliente_${i}.csv"
-
-            cd /
-            rm -rf "$DIR"
-            exit "$STATUS"
+            ST=$?
+            exit $ST
         ) &
         PIDS+=("$!")
     done
 
+    # espera cada cliente e guarda o status na ordem
+    i=0
     for PID in "${PIDS[@]}"; do
-        wait "$PID" || FALHAS=$((FALHAS+1))
+        i=$((i+1))
+        wait "$PID"
+        ST=$?
+
+        D="$BASE/c$i"
+
+        if [ "$ST" -eq 0 ] && [ -s "$D/out.txt" ]; then
+            echo "$REP,$i,0,$(head -n1 "$D/out.txt")" >> "$CSV"
+        else
+            FALHAS=$((FALHAS+1))
+            echo "$REP,$i,1,PUT,0,0,0,0,0,0" >> "$CSV"
+            echo "rep $REP cli $i (exit $ST): $(head -n1 "$D/err.txt")" >> "$ERROS"
+        fi
+
+        rm -rf "$D"
     done
 
-    FIM_TOTAL=$(date +%s%N)
-    TEMPO_TOTAL=$(awk -v ini="$INICIO_TOTAL" -v fim="$FIM_TOTAL" \
-        'BEGIN { printf "%.6f", (fim-ini)/1e9 }')
+    FIM=$(date +%s.%N)
 
-    cat "$METRICAS"/cliente_*.csv >> "$CSV"
-    rm -rf "$METRICAS"
-    echo "Tempo total: $TEMPO_TOTAL s"
+    echo "Repeticao $REP/$REPETICOES: $(awk -v a="$INI" -v b="$FIM" 'BEGIN{printf "%.3f",b-a}') s"
 done
 
-echo "Testes finalizados. Falhas: $FALHAS"
+echo "Falhas: $FALHAS (detalhes em $ERROS)"
 echo "Resultados: $CSV"

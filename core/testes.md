@@ -34,3 +34,14 @@
 - Uma medida para a requisicao inteira (connect ate a resposta do servidor)
 - Uma medida para o tempo de transferencia do arquivo
 - Calculo da vazao para o tempo total da requisicao e para o tempo de transferecnia de arquivo
+
+#Fibra
+time=5.49 ms
+400 Mbps downstream
+200 Mbps upstream
+
+#4G
+time=20.0 ms
+45 Mbps downstream
+22 Mbps upstream
+

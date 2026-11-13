@@ -1,11 +1,11 @@
 """Estatisticas e graficos dos testes de GET (Trabalho 1 de Redes).
 
-Uso:  .venv/bin/python analise/analise.py  [metodo]   (padrao: get)
+Uso:  .venv/bin/python analise/analise.py  [get | put | comparar]   (padrao: get)
 
 Le testes/<metodo>-<N>-clientes-<arquivo>-<link>/resultados.csv, descarta as
 requisicoes com status != 0 e gera, em analise/:
   - estatisticas_<metodo>.csv  (uma linha por cenario x metrica)
-  - graficos/*.png             (7 graficos, numerados pela ordem da analise)
+  - graficos/<metodo>/*.png             (7 graficos, numerados pela ordem da analise)
 
 Unidade amostral: a REPETICAO. Dentro de uma repeticao os clientes disputam o
 mesmo enlace, entao nao sao independentes. Para cada repeticao tiramos a media
@@ -28,9 +28,8 @@ from scipy import stats
 RAIZ = Path(__file__).resolve().parent.parent
 TESTES = RAIZ / "testes"
 SAIDA = RAIZ / "analise"
-GRAFICOS = SAIDA / "graficos"
-
 METODO = sys.argv[1].lower() if len(sys.argv) > 1 else "get"
+GRAFICOS = SAIDA / "graficos" / METODO  # uma pasta por metodo (get, put, comparar)
 
 PADRAO = re.compile(r"^(get|put)-(\d+)-clientes-(pagina_web|video)-(4G|fibra)$")
 
@@ -43,8 +42,9 @@ METRICAS = {
     "fracao_dados_pct": "tempo de transferencia / tempo total (%)",
 }
 
-# Capacidade do enlace de acesso no sentido servidor -> cliente (core/testes.md)
-CAPACIDADE_DOWN = {"fibra": 400, "4G": 45}
+# Capacidade do enlace de acesso (core/testes.md). GET trafega no sentido
+# servidor -> cliente (download); PUT no sentido cliente -> servidor (upload).
+CAPACIDADE = {"get": {"fibra": 400, "4G": 45}, "put": {"fibra": 200, "4G": 22}}
 
 ARQUIVOS = ["pagina_web", "video"]
 NOME_ARQUIVO = {"pagina_web": "Pagina web", "video": "Video (~8 MB)"}
@@ -62,9 +62,9 @@ FUNDO = "#fcfcfb"
 
 # ----------------------------------------------------------------- dados
 
-def carregar() -> pd.DataFrame:
+def carregar(metodo: str) -> pd.DataFrame:
     partes = []
-    for csv in sorted(TESTES.glob(f"{METODO}-*/resultados.csv")):
+    for csv in sorted(TESTES.glob(f"{metodo}-*/resultados.csv")):
         m = PADRAO.match(csv.parent.name)
         if not m:
             continue
@@ -74,10 +74,10 @@ def carregar() -> pd.DataFrame:
         df["link"] = m.group(4)
         partes.append(df)
     if not partes:
-        sys.exit(f"nenhum resultado de {METODO} em {TESTES}")
+        sys.exit(f"nenhum resultado de {metodo} em {TESTES}")
     df = pd.concat(partes, ignore_index=True)
     falhas = (df["status"] != 0).sum()
-    print(f"{len(df)} requisicoes, {falhas} falhas descartadas")
+    print(f"{metodo}: {len(df)} requisicoes, {falhas} falhas descartadas")
     df = df[df["status"] == 0].copy()
     df["fracao_dados_pct"] = 100 * df["t_dados_ms"] / df["t_req_ms"]
     return df
@@ -173,6 +173,8 @@ def moldura(fig, titulo, nota, handles, labels):
     via rcParams) | grafico | legenda | nota de leitura.
     """
     fig.subplots_adjust(top=0.78, bottom=0.31, wspace=0.28)
+    if METODO in CAPACIDADE:
+        titulo = f"{METODO.upper()}: {titulo}"
     fig.suptitle(titulo, x=0.5, y=0.985, ha="center", va="top",
                  color=TEXTO_2, fontsize=13, fontweight="bold")
     fig.legend(handles, labels, loc="lower center", ncol=len(labels),
@@ -188,7 +190,7 @@ def escala(arquivo: str, met: str):
     return 1.0, None
 
 
-def linhas_por_link(est, met, titulo, nome, ylabel, referencia=False):
+def linhas_por_link(est, met, titulo, nome, ylabel):
     fig, eixos = plt.subplots(1, 2, figsize=(11, 5.4))
     x = range(len(CLIENTES))
     for ax, arq in zip(eixos, ARQUIVOS):
@@ -207,14 +209,6 @@ def linhas_por_link(est, met, titulo, nome, ylabel, referencia=False):
         for link, y in finais.items():
             ax.annotate(link, (x[-1], y), xytext=(10, 7 if link == alto else -7),
                         textcoords="offset points", va="center", color=TEXTO_2)
-        if referencia:
-            for link in LINKS:
-                cap = CAPACIDADE_DOWN[link]
-                ax.axhline(cap, color=COR[link], linestyle="--", linewidth=1)
-                ax.annotate(f"capacidade {link}: {cap} Mbps", (0, cap),
-                            xytext=(0, 4), textcoords="offset points",
-                            color=TEXTO_2, fontsize=8)
-            ax.set_yscale("log")
         ax.set_xticks(list(x), [str(c) for c in CLIENTES])
         ax.set_xlim(-0.3, len(CLIENTES) - 0.4)
         ax.set_xlabel("clientes simultaneos")
@@ -375,14 +369,16 @@ def fracao_dados(est):
 def ocupacao_link(est):
     """Vazao agregada (soma dos clientes) como % da capacidade do link, video."""
     fig, ax = plt.subplots(figsize=(7, 5.4))
+    cap = CAPACIDADE[METODO]
+    sentido = "download" if METODO == "get" else "upload"
     larg = 0.36
     for j, link in enumerate(LINKS):
         d = (est[(est.metrica == "vazao_agregada_mbps") & (est.arquivo == "video")
                  & (est.link == link)].set_index("clientes").reindex(CLIENTES))
-        pct = 100 * d["media"] / CAPACIDADE_DOWN[link]
+        pct = 100 * d["media"] / cap[link]
         pos = [i + (j - 0.5) * (larg + 0.03) for i in range(len(CLIENTES))]
         barras = ax.bar(pos, pct, width=larg, color=COR[link],
-                        label=f"{link} ({CAPACIDADE_DOWN[link]} Mbps)")
+                        label=f"{link} ({cap[link]} Mbps)")
         for b in barras:
             ax.annotate(f"{b.get_height():.0f}%",
                         (b.get_x() + b.get_width() / 2, b.get_height()),
@@ -395,12 +391,98 @@ def ocupacao_link(est):
     ax.set_xlabel("clientes simultaneos")
     ax.set_ylabel("uso da capacidade do link (%)")
     ax.set_ylim(0, 118)
-    ax.set_title("GET de video")
+    ax.set_title(NOME_ARQUIVO["video"])
     h, l = ax.get_legend_handles_labels()
     moldura(fig, "Ocupacao do link", "soma da vazao de todos os clientes / "
-            "capacidade de download do link", h, l)
+            f"capacidade de {sentido} do link", h, l)
     fig.savefig(GRAFICOS / "6_ocupacao_link.png")
     plt.close(fig)
+
+
+# ----------------------------------------------------------------- GET x PUT
+
+def comparar_linhas(ests, met, titulo, nome, ylabel):
+    """Mesmo grafico de linhas, com GET (cheia) e PUT (tracejada) juntos."""
+    fig, eixos = plt.subplots(1, 2, figsize=(11, 5.4))
+    x = list(range(len(CLIENTES)))
+    tracos = {"get": ("-", True), "put": ("--", False)}
+    for ax, arq in zip(eixos, ARQUIVOS):
+        fator, _ = escala(arq, met)
+        unidade = "s" if fator != 1 else ylabel.split("(")[-1].rstrip(")")
+        for link in LINKS:
+            for metodo, (ls, cheio) in tracos.items():
+                est = ests[metodo]
+                d = (est[(est.metrica == met) & (est.arquivo == arq)
+                         & (est.link == link)].set_index("clientes").reindex(CLIENTES))
+                ax.errorbar(x, d["media"] * fator, yerr=d["ic95"] * fator,
+                            color=COR[link], marker=MARCADOR[link], markersize=7,
+                            mfc=COR[link] if cheio else FUNDO, linewidth=2,
+                            linestyle=ls, capsize=4,
+                            label=f"{link}, {metodo.upper()}")
+        ax.set_xticks(x, [str(c) for c in CLIENTES])
+        ax.set_xlabel("clientes simultaneos")
+        ax.set_ylabel(ylabel.rsplit("(", 1)[0] + f"({unidade})")
+        ax.set_title(NOME_ARQUIVO[arq])
+    h, l = eixos[0].get_legend_handles_labels()
+    moldura(fig, "GET x PUT: " + titulo,
+            "linha cheia: GET; tracejada: PUT. Pontos: media das 11 repeticoes; "
+            "barras: IC 95%", h, l)
+    fig.savefig(GRAFICOS / nome)
+    plt.close(fig)
+
+
+def comparar_ocupacao(ests):
+    """Ocupacao do link no video: GET sobre o download, PUT sobre o upload."""
+    fig, eixos = plt.subplots(1, 2, figsize=(11, 5.4), sharey=True)
+    larg = 0.36
+    for ax, link in zip(eixos, LINKS):
+        for j, metodo in enumerate(["get", "put"]):
+            est = ests[metodo]
+            d = (est[(est.metrica == "vazao_agregada_mbps") & (est.arquivo == "video")
+                     & (est.link == link)].set_index("clientes").reindex(CLIENTES))
+            cap = CAPACIDADE[metodo][link]
+            pos = [i + (j - 0.5) * (larg + 0.03) for i in range(len(CLIENTES))]
+            barras = ax.bar(pos, 100 * d["media"] / cap, width=larg,
+                            color=COR[link] if metodo == "get" else FUNDO,
+                            edgecolor=COR[link], linewidth=1.5,
+                            hatch=None if metodo == "get" else "///",
+                            label=metodo.upper())
+            rotular_barras(ax, barras, "{:.0f}%")
+        ax.axhline(100, color=TEXTO_2, linestyle="--", linewidth=1)
+        ax.set_xticks(range(len(CLIENTES)), [str(c) for c in CLIENTES])
+        ax.set_xlabel("clientes simultaneos")
+        ax.set_title(f"{link} ({CAPACIDADE['get'][link]} down / "
+                     f"{CAPACIDADE['put'][link]} up Mbps)")
+        ax.set_ylim(0, 118)
+    eixos[0].set_ylabel("uso da capacidade do link (%)")
+    h = [plt.Rectangle((0, 0), 1, 1, fc=TEXTO_2, ec=TEXTO_2),
+         plt.Rectangle((0, 0), 1, 1, fc=FUNDO, ec=TEXTO_2, hatch="///")]
+    moldura(fig, "GET x PUT: ocupacao do link no video",
+            "soma da vazao de todos os clientes / capacidade do link no sentido "
+            "da transferencia\n(GET: download; PUT: upload). 100% = link cheio.",
+            h, ["GET", "PUT"])
+    fig.savefig(GRAFICOS / "6_ocupacao_link.png")
+    plt.close(fig)
+
+
+def comparar():
+    ests = {}
+    for metodo in ("get", "put"):
+        df = carregar(metodo)
+        ests[metodo] = estatisticas(df, por_repeticao(df))
+    comparar_linhas(ests, "t_req_ms", "tempo total da requisicao",
+                    "1_tempo_requisicao.png", "tempo total (ms)")
+    comparar_linhas(ests, "t_dados_ms", "tempo de transferencia dos dados",
+                    "2_tempo_transferencia.png", "tempo de transferencia (ms)")
+    comparar_linhas(ests, "vazao_req_mbps", "vazao por cliente (requisicao inteira)",
+                    "4_vazao_por_cliente.png", "vazao por cliente (Mbps)")
+    comparar_linhas(ests, "fracao_dados_pct",
+                    "quanto do tempo e transferencia de dados",
+                    "4b_fracao_tempo_dados.png", "tempo transferindo dados (%)")
+    comparar_linhas(ests, "rtt_ms", "RTT do connect",
+                    "5_rtt.png", "RTT (ms)")
+    comparar_ocupacao(ests)
+    print(f"\nsaida em {GRAFICOS}")
 
 
 # ----------------------------------------------------------------- main
@@ -416,7 +498,9 @@ def resumo_terminal(est):
 def main():
     GRAFICOS.mkdir(parents=True, exist_ok=True)
     estilo()
-    df = carregar()
+    if METODO == "comparar":
+        return comparar()
+    df = carregar(METODO)
     rep = por_repeticao(df)
     est = estatisticas(df, rep)
     est.to_csv(SAIDA / f"estatisticas_{METODO}.csv", index=False,

@@ -1,6 +1,6 @@
 # Tipos de arquivo
 - MP4
-- PDF
+- pagina web
 
 # Requisicoes
 - P processos de cliente rodando no noh
